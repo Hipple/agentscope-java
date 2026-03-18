@@ -12,7 +12,12 @@ Agent Skills are modular skill packages that extend agent capabilities. Each Ski
 
 Adopts **three-stage on-demand loading** to optimize context: Initially loads only metadata (~100 tokens/Skill) → AI loads complete instructions when needed (<5k tokens) → On-demand access to resource files. Tools are also progressively disclosed, activated only when the Skill is in use.
 
-**Workflow:** User Query → AI Identifies Relevant Skill → Calls Tools to Load Content and Activate Bound Tools → On-Demand Resource Access → Task Completion
+**Workflow:** User Query → AI Identifies Relevant Skill → Calls `load_skill_through_path` Tool to Load Content and Activate Bound Tools → On-Demand Resource Access → Task Completion
+
+**Unified Loading Tool**: `load_skill_through_path(skillId, resourcePath)` provides a single entry point for loading skill resources
+- `skillId` uses an enum field, ensuring selection only from registered Skills, guaranteeing accuracy
+- `resourcePath` is the resource path relative to the Skill root directory (e.g., `references/api-doc.md`)
+- Returns a list of all available resource paths when the path is incorrect, helping the LLM correct errors
 
 ### Adaptive Design
 
@@ -23,7 +28,7 @@ We have further abstracted skills so that their discovery and content loading ar
 Taking the [Skill Structure](#skill-structure) as an example, this directory-structured skill is represented in our system as:
 
 ```java
-AgentSkill skill = new AgentSkill.builder()
+AgentSkill skill = AgentSkill.builder()
     .name("data_analysis")
     .description("Use this skill when analyzing data, calculating statistics, or generating reports")
     .skillContent("# Data Analysis\n...")
@@ -132,7 +137,7 @@ AgentSkill skill = new AgentSkill(
 Toolkit toolkit = new Toolkit();
 
 SkillBox skillBox = new SkillBox(toolkit);
-skillBox.registerAgentSkill(skill1);
+skillBox.registerSkill(skill1);
 
 ReActAgent agent = ReActAgent.builder()
         .name("DataAnalyst")
@@ -150,7 +155,7 @@ ReActAgent agent = ReActAgent.builder()
 ```java
 SkillBox skillBox = new SkillBox();
 
-skillBox.registerAgentSkill(dataSkill);
+skillBox.registerSkill(dataSkill);
 
 ReActAgent agent = ReActAgent.builder()
     .name("Assistant")
@@ -164,6 +169,8 @@ ReActAgent agent = ReActAgent.builder()
 ### Feature 1: Progressive Disclosure of Tools
 
 Bind Tools to Skills for on-demand activation. Avoids context pollution from pre-registering all Tools, only passing relevant Tools to LLM when the Skill is actively used.
+
+**Lifecycle of Progressively Disclosed Tools**: Tool lifecycle remains consistent with Skill lifecycle. Once a Skill is activated, Tools remain available throughout the entire session, avoiding the call failures caused by Tool deactivation after each conversation round in the old mechanism.
 
 **Example Code**:
 
@@ -192,17 +199,60 @@ ReActAgent agent = ReActAgent.builder()
     .build();
 ```
 
-### Feature 2: Skill Persistence Storage
+### Feature 2: Code Execution Capabilities
+
+Provides an isolated code execution folder for Skills, supporting Shell commands, file read/write operations, etc. Uses Builder pattern for flexible configuration of required tools.
+
+**Basic Usage**:
+
+```java
+SkillBox skillBox = new SkillBox(toolkit);
+
+// Enable all code execution tools (Shell, read file, write file)
+skillBox.codeExecution()
+    .withShell()
+    .withRead()
+    .withWrite()
+    .enable();
+```
+
+**Custom Configuration**:
+
+```java
+// Customize working directory and Shell command whitelist
+ShellCommandTool customShell = new ShellCommandTool(
+    null,  // baseDir will be automatically set to workDir
+    Set.of("python3", "node", "npm"),
+    command -> askUserApproval(command)  // Optional command approval callback
+);
+
+skillBox.codeExecution()
+    .workDir("/path/to/workdir")  // Specify working directory
+    .withShell(customShell)       // Use custom Shell tool
+    .withRead()                   // Enable file reading
+    .withWrite()                  // Enable file writing
+    .enable();
+
+// Or enable only file operations, without Shell
+skillBox.codeExecution()
+    .withRead()
+    .withWrite()
+    .enable();
+```
+
+**Core Features**:
+- **Unified Working Directory**: All tools share the same `workDir`, ensuring file isolation
+- **Selective Enabling**: Flexibly combine Shell, read file, and write file tools as needed
+- **Flexible Configuration**: Supports custom ShellCommandTool to meet customization requirements
+- **Automatic Management**: Automatically creates temporary directory when `workDir` is not specified, with automatic cleanup on program exit
+
+### Feature 3: Skill Persistence Storage
 
 **Why is this feature needed?**
 
 Skills need to remain available after application restart, or be shared across different environments. Persistence storage supports:
 
-- File system storage
-- Database storage (not yet implemented)
-- Git repository (not yet implemented)
-
-**Example Code**:
+#### File System Storage
 
 ```java
 AgentSkillRepository repo = new FileSystemSkillRepository(Path.of("./skills"));
@@ -210,9 +260,78 @@ repo.save(List.of(skill), false);
 AgentSkill loaded = repo.getSkill("data_analysis");
 ```
 
-This protection applies to all repository operations: `getSkill()`, `save()`, `delete()`, and `skillExists()`.
+#### MySQL Database Storage
 
-For detailed security guidelines, please refer to [Claude Agent Skills Security Considerations](https://platform.claude.com/docs/zh-CN/agents-and-tools/agent-skills/overview#安全考虑).
+```java
+// Using simple constructor with default database/table names
+DataSource dataSource = createDataSource();
+MysqlSkillRepository repo = new MysqlSkillRepository(dataSource, true, true);
+
+// Using Builder for custom configuration
+MysqlSkillRepository repo = MysqlSkillRepository.builder(dataSource)
+        .databaseName("my_database")
+        .skillsTableName("my_skills")
+        .resourcesTableName("my_resources")
+        .createIfNotExist(true)
+        .writeable(true)
+        .build();
+
+repo.save(List.of(skill), false);
+AgentSkill loaded = repo.getSkill("data_analysis");
+```
+
+#### Git Repository (Read-Only)
+
+Used to load Skills from a Git repository (read-only). Supports HTTPS and SSH.
+
+**Update mechanism**
+- By default, each read triggers a lightweight remote reference check; a pull runs only when the
+    remote HEAD changes.
+- You can disable auto-sync via the constructor and call `sync()` manually when you want to
+    refresh.
+
+```java
+AgentSkillRepository repo = new GitSkillRepository(
+    "https://github.com/your-org/your-skills-repo.git");
+AgentSkill skill = repo.getSkill("data-analysis");
+List<AgentSkill> allSkills = repo.getAllSkills();
+
+GitSkillRepository manualRepo = new GitSkillRepository(
+    "https://github.com/your-org/your-skills-repo.git", false);
+manualRepo.sync();
+```
+
+If the repository contains a `skills/` subdirectory, it will be used; otherwise the repo root
+is used.
+
+#### Classpath Repository (Read-Only)
+
+Used to load pre-packaged Skills from classpath resources. Automatically compatible with standard JARs and Spring Boot Fat JARs.
+
+```java
+try (ClasspathSkillRepository repository = new ClasspathSkillRepository("skills")) {
+    AgentSkill skill = repository.getSkill("data-analysis");
+    List<AgentSkill> allSkills = repository.getAllSkills();
+} catch //...
+```
+
+Resource structure: Place multiple skill subdirectories under `src/main/resources/skills/`, each containing a `SKILL.md`.
+
+> Note: `JarSkillRepositoryAdapter` is deprecated. Use `ClasspathSkillRepository` instead.
+
+#### Nacos Repository (Read-Only)
+
+Pulls or subscribes to Skills from Nacos via a pre-built `AiService` (or Nacos connection config). The Agent fetches Skills from Nacos at runtime in real time, with support for change subscription and automatic awareness. Suitable for online scenarios that need to stay in sync with Nacos.
+
+```java
+// Create Nacos skill repository with a pre-built AiService
+try (NacosSkillRepository repository = new NacosSkillRepository(aiService, "namespace")) {
+    AgentSkill skill = repository.getSkill("data-analysis");
+    boolean exists = repository.skillExists("data-analysis");
+} catch //...
+```
+
+> Note: Add the `agentscope-extensions-nacos-skill` dependency.
 
 ### Performance Optimization Recommendations
 
